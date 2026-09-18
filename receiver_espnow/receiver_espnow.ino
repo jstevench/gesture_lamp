@@ -6,6 +6,9 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   int counter;
   memcpy(&counter, data, sizeof(counter));
   Serial.println("Received: " + String(counter));
+  digitalWrite(8, LOW); // Turn LED on
+  delay(500);
+  digitalWrite(8, HIGH); // Turn LED on
 }
 
 void setup() {
@@ -22,7 +25,8 @@ void setup() {
     Serial.println("[FAILED] esp_now_init error");
     return;
   }
-
+  
+  pinMode(8, OUTPUT);
   esp_now_register_recv_cb(onDataRecv);
   Serial.println("Ready. Waiting for counter...");
 }
