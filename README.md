@@ -6,6 +6,44 @@ classic ESP32 board with a USB-to-serial bridge described below.
 
 ## Current board: classic ESP32 + MPU6050
 
+### Wireless gesture sender
+
+`sender_espnow/sender_espnow.ino` now combines the working MPU6050 detector with
+ESP-NOW on the **classic ESP32** (SDA 21, SCL 22). It replaces the old C3 BOOT
+button sender. The standalone `gesture_test_esp32` sketch remains available.
+Use **esp32 by Espressif Systems 3.3.12**, the version used for the successful
+sensor test; the send callback signature depends on the core/ESP-IDF version.
+
+1. Upload `receiver_espnow/receiver_espnow.ino` to the **receiver C3**, using
+   **ESP32C3 Dev Module** and **USB CDC On Boot > Enabled**. Open its Serial
+   Monitor at 115200 and press RESET to read **This receiver's MAC address**.
+2. Put that address in `receiverMAC` near the top of the sender sketch. The
+   existing `70:AF:09:0D:D0:A8` is retained from the original sender and must be
+   verified; do not replace it with the new sender's own MAC.
+3. Upload `sender_espnow/sender_espnow.ino` to the sensor-equipped **classic
+   ESP32**, using **ESP32 Dev Module** and its COM port. Wiring stays as below.
+4. Power both boards. No router is required. Both sketches explicitly use
+   **radio channel 1**. Hold the MPU6050 still for calibration, then flick and
+   pause until the sender reports `Armed. Ready for next flick.`.
+5. Check the sender for `Queued gesture command: 1` (up) or `-1` (down), followed
+   by `Send OK`. Check the receiver for `Received: FLICK UP (1)` or
+   `Received: FLICK DOWN (-1)` and an onboard LED flash.
+
+The payload is one four-byte signed integer: **1 = up**, **-1 = down**. The old
+integer receiver can print these values too; the updated receiver names the
+gestures, validates packet length, and keeps work outside the Wi-Fi callback.
+`Send OK` means radio delivery, not confirmation that a lamp changed state.
+There are no automatic retries or application acknowledgements in this prototype.
+If delivery fails, check receiver power, its station MAC, and matching channels.
+The receiver LED is GPIO8, active-low, for the original C3 board; other receiver
+boards need their LED configuration checked. Actual lamp output remains to be
+implemented once its driver/pin wiring and desired gesture actions are known.
+
+The combined wireless sketches still require compilation and a two-board
+hardware test. Reference: [Espressif ESP-NOW documentation](https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32c3/api-reference/network/esp_now.html).
+
+### Standalone sensor test
+
 Use `gesture_test_esp32/gesture_test_esp32.ino` for the replacement ESP32 board.
 The existing `gesture_test/gesture_test.ino` currently contains a GPIO contact
 test; it is not the flick detector. This new sketch keeps the original flick
@@ -39,9 +77,9 @@ compilation and a hardware test on the replacement board.
 
 ## Flick detection: ESP32-C3 Super Mini + MPU6050 (HW-123)
 
-Open `gesture_test/gesture_test.ino` for the standalone gesture test. It reads
-the MPU6050 and prints `FLICK UP` or `FLICK DOWN`. The existing ESP-NOW sender
-and receiver remain separate radio tests; this sketch does not control the lamp.
+These are the original C3 sensor wiring notes. `gesture_test/gesture_test.ino`
+has since been replaced with a GPIO contact test; use `gesture_test_esp32` for
+the working classic ESP32 sensor test or `sender_espnow` for wireless gestures.
 
 ### Wiring
 
