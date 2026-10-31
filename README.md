@@ -1,7 +1,41 @@
 # gesture_lamp
 gesture controlled lamp powered by esp32
 
-WHEN UPLOADING CODE ENABLE USB CDC ON BOOT VERY IMPORTANT
+For ESP32-C3 USB Serial, enable USB CDC On Boot. This does not apply to the
+classic ESP32 board with a USB-to-serial bridge described below.
+
+## Current board: classic ESP32 + MPU6050
+
+Use `gesture_test_esp32/gesture_test_esp32.ino` for the replacement ESP32 board.
+The existing `gesture_test/gesture_test.ino` currently contains a GPIO contact
+test; it is not the flick detector. This new sketch keeps the original flick
+algorithm and includes an I2C scan if sensor initialization fails.
+
+Disconnect USB before wiring. Follow the board's printed pin labels, not the
+old C3 breadboard row numbers:
+
+| MPU6050 wire | Classic ESP32 pin label |
+| --- | --- |
+| Red: VCC | 3V3 |
+| Black: GND | GND |
+| Yellow: SDA | D21 / GPIO21 |
+| Green: SCL | D22 / GPIO22 |
+
+In Arduino IDE select **ESP32 Dev Module** and the new board's COM port.
+Use the same Adafruit MPU6050 library and dependencies. Upload the new sketch,
+open Serial Monitor at **115200 baud**, press **EN** to restart, and hold the
+sensor still until `Ready!`. Then test vertical flicks as described below.
+After each flick, pause until `Armed. Ready for next flick.` appears. This
+version checks stillness independently of the startup angle and refreshes the
+vertical reference after a stable pause, so a small change in holding angle
+does not leave the detector waiting indefinitely. Keep orientation steady
+during each flick; arbitrary rotation can still cause false detections.
+This board uses a USB-to-serial bridge; there is no USB CDC On Boot setting
+to enable. If uploading remains at `Connecting...`, hold BOOT until writing
+starts, then release it.
+
+The C3 instructions below are retained for reference. The new sketch requires
+compilation and a hardware test on the replacement board.
 
 ## Flick detection: ESP32-C3 Super Mini + MPU6050 (HW-123)
 
@@ -56,7 +90,11 @@ Press RESET to recalibrate if you change how you hold or mount the sensor.
 
 ### Troubleshooting and tuning
 
-- **MPU6050 not found:** check the four wires, power, and matching pin constants.
+- **MPU6050 not found:** the sketch now scans the I2C bus and prints responding
+  addresses. Copy that output for diagnosis. No responses means checking the four
+  wires, matching pin constants, header contact, and solder joints first; a lit
+  sensor LED does not confirm data communication. A response with failed
+  initialization needs further diagnosis of the sensor and connection.
 - **Calibration failed:** keep the sensor still and press RESET to retry.
 - **No Serial output:** check the port, 115200 baud, and USB CDC On Boot setting.
 - **Flicks missed:** lower `TRIGGER_MS2` from 3.0 to 2.0 and try again.
