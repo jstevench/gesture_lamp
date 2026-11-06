@@ -1,31 +1,42 @@
 ﻿#include <WiFi.h>
 #include <esp_now.h>
+#include <esp_mac.h>
 #include <esp_wifi.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
 constexpr uint8_t RADIO_CHANNEL = 1;
-constexpr int LED_PIN = 8; // Active-low onboard LED on the C3 receiver.
+
+constexpr int PWM_PIN = 23;         // to MOSFET gate (through 220 ohm)
+constexpr int PWM_FREQ = 5000;
+constexpr int PWM_RES = 8;          // duty 0-255
+constexpr int PWM_STEP = 10;
+
 QueueHandle_t commands = nullptr;
 bool ready = false;
-bool ledOn = false;
-uint32_t ledStarted = 0;
+int pwmPower = 50;
 
-// Callback: runs whenever a packet arrives
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len != sizeof(int32_t)) return;
   int32_t command;
   memcpy(&command, data, sizeof(command));
-  // Do not print or delay in the Wi-Fi callback task.
   xQueueSend(commands, &command, 0);
+}
+
+void printMac() {
+  uint8_t mac[6];
+  esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  Serial.printf("This receiver's MAC address: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+  ledcWrite(PWM_PIN, pwmPower);
+
   if (!WiFi.mode(WIFI_STA)) {
     Serial.println("ERROR: Could not start Wi-Fi.");
     return;
@@ -41,15 +52,12 @@ void setup() {
     return;
   }
 
-  // Print this board's MAC address 鈥?you need to paste this into the SENDER sketch
-  Serial.print("This receiver's MAC address: ");
-  Serial.println(WiFi.macAddress());
+  printMac();
 
   if (esp_now_init() != ESP_OK) {
     Serial.println("[FAILED] esp_now_init error");
     return;
   }
-  
   if (esp_now_register_recv_cb(onDataRecv) != ESP_OK) {
     Serial.println("ERROR: Could not register receive callback.");
     return;
@@ -63,18 +71,20 @@ void loop() {
     delay(10);
     return;
   }
+
   int32_t command;
   if (xQueueReceive(commands, &command, 0) == pdTRUE) {
-    if (command == 1) Serial.println("Received: FLICK UP (1)");
-    else if (command == -1) Serial.println("Received: FLICK DOWN (-1)");
-    else Serial.printf("Received: %ld (unknown command)\n", static_cast<long>(command));
-    digitalWrite(LED_PIN, LOW);
-    ledOn = true;
-    ledStarted = millis();
-  }
-  if (ledOn && millis() - ledStarted >= 500) {
-    digitalWrite(LED_PIN, HIGH);
-    ledOn = false;
+    if (command == 1) {
+      pwmPower = constrain(pwmPower + PWM_STEP, 0, 255);
+      ledcWrite(PWM_PIN, pwmPower);
+      Serial.printf("Received: FLICK UP (+1) | POWER: %d\n", pwmPower);
+    } else if (command == -1) {
+      pwmPower = constrain(pwmPower - PWM_STEP, 0, 255);
+      ledcWrite(PWM_PIN, pwmPower);
+      Serial.printf("Received: FLICK DOWN (-1) | POWER: %d\n", pwmPower);
+    } else {
+      Serial.printf("Received: %ld (unknown command)\n", static_cast<long>(command));
+    }
   }
   delay(1);
 }
