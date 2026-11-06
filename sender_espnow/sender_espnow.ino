@@ -19,7 +19,7 @@ constexpr uint32_t QUIET_TIME_MS = 200;
 constexpr bool PRINT_READINGS = false; // true: also print X/Y/Z for debugging.
 
 // Original receiver address: verify against the RECEIVER's Serial Monitor.
-uint8_t receiverMAC[] = {0x70, 0xAF, 0x09, 0x0D, 0xD0, 0xA8};
+uint8_t receiverMAC[] = {0x30, 0x76, 0xF5, 0x91, 0xF3, 0x50};
 constexpr uint8_t RADIO_CHANNEL = 1; // Must match receiver_espnow.
 constexpr int32_t FLICK_UP_COMMAND = 1;
 constexpr int32_t FLICK_DOWN_COMMAND = -1;
