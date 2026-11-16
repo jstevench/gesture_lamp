@@ -11,7 +11,8 @@
 constexpr int SDA_PIN = 21;
 constexpr int SCL_PIN = 22;
 constexpr uint32_t SAMPLE_MS = 10;  // About 100 readings per second.
-constexpr float TRIGGER_MS2 = 3.0f; // Lower = more sensitive.
+constexpr float TRIGGER_MS2 = 6.0f; // Lower = more sensitive.
+constexpr float TRIGGER_SIDE_MS2 = 6.0f; // Left/right sensitivity. Lower = more sensitive.
 constexpr float QUIET_MS2 = 1.0f;
 constexpr float STILL_CHANGE_MS2 = 0.8f;
 constexpr uint32_t COOLDOWN_MS = 450;
@@ -23,6 +24,12 @@ uint8_t receiverMAC[] = {0x30, 0x76, 0xF5, 0x91, 0xF3, 0x50};
 constexpr uint8_t RADIO_CHANNEL = 1; // Must match receiver_espnow.
 constexpr int32_t FLICK_UP_COMMAND = 1;
 constexpr int32_t FLICK_DOWN_COMMAND = -1;
+constexpr int32_t FLICK_RIGHT_COMMAND = 2;   // Receiver must handle these two.
+constexpr int32_t FLICK_LEFT_COMMAND = -2;
+// Sensor axis that points to your RIGHT when held normally. If left and
+// right come out swapped, change 1.0f to -1.0f. If the sensor is mounted so
+// its Y axis points right instead, use {0, 1, 0}.
+constexpr float RIGHT_AXIS[3] = {1.0f, 0.0f, 0.0f};
 static_assert(sizeof(int32_t) == 4, "Gesture packets must be four bytes");
 std::atomic<int> sendResult{-1};
 bool sendInFlight = false;
@@ -63,12 +70,12 @@ void reportSendResult() {
       : "Send FAILED: check receiver power, MAC and channel.");
 }
 
-void sendGesture(bool up) {
+void sendGesture(int32_t command) {
   if (sendInFlight) {
     Serial.println("Send skipped: previous packet still pending.");
     return;
   }
-  outgoingCommand = up ? FLICK_UP_COMMAND : FLICK_DOWN_COMMAND;
+  outgoingCommand = command;
   sendInFlight = true;
   const esp_err_t result = esp_now_send(receiverMAC,
       reinterpret_cast<const uint8_t *>(&outgoingCommand), sizeof(outgoingCommand));
@@ -91,6 +98,8 @@ bool armed = false;
 bool quietTiming = false;
 uint8_t positiveSamples = 0;
 uint8_t negativeSamples = 0;
+uint8_t rightSamples = 0;
+uint8_t leftSamples = 0;
 uint32_t lastSample = 0;
 uint32_t lastGesture = 0;
 uint32_t quietSince = 0;
@@ -178,7 +187,7 @@ void setup() {
   }
   ready = true;
   gravityMagnitude = sqrtf(restX*restX + restY*restY + restZ*restZ);
-  Serial.println("Ready! Flick UP or DOWN without twisting the sensor.");
+  Serial.println("Ready! Flick UP, DOWN, LEFT or RIGHT without twisting the sensor.");
 }
 
 void loop() {
@@ -204,6 +213,18 @@ void loop() {
   // At rest the accelerometer points upward. Project the change onto that
   // direction, so the sensor need not be mounted with a particular axis up.
   const float vertical = (dx*restX + dy*restY + dz*restZ) / restMagnitude;
+  // Sideways direction: the RIGHT_AXIS with its gravity component removed, so
+  // it lies flat (horizontal) whatever the tilt. Left/right = change along it.
+  const float ux = restX / restMagnitude;
+  const float uy = restY / restMagnitude;
+  const float uz = restZ / restMagnitude;
+  const float axisDotUp = RIGHT_AXIS[0]*ux + RIGHT_AXIS[1]*uy + RIGHT_AXIS[2]*uz;
+  const float rx = RIGHT_AXIS[0] - axisDotUp*ux;
+  const float ry = RIGHT_AXIS[1] - axisDotUp*uy;
+  const float rz = RIGHT_AXIS[2] - axisDotUp*uz;
+  const float rNorm = sqrtf(rx*rx + ry*ry + rz*rz);
+  // If the right axis points almost straight up/down, sideways is undefined.
+  const float side = rNorm > 0.3f ? (dx*rx + dy*ry + dz*rz) / rNorm : 0.0f;
   const float magnitude = sqrtf(a.acceleration.x*a.acceleration.x +
                                 a.acceleration.y*a.acceleration.y +
                                 a.acceleration.z*a.acceleration.z);
@@ -215,8 +236,8 @@ void loop() {
 
   if (PRINT_READINGS && now - lastDebug >= 100) {
     lastDebug = now;
-    Serial.printf("X:%.2f Y:%.2f Z:%.2f Vertical:%.2f m/s^2\n",
-                  a.acceleration.x, a.acceleration.y, a.acceleration.z, vertical);
+    Serial.printf("X:%.2f Y:%.2f Z:%.2f Vertical:%.2f Side:%.2f m/s^2\n",
+                  a.acceleration.x, a.acceleration.y, a.acceleration.z, vertical, side);
   }
 
   if (!armed) {
@@ -249,6 +270,7 @@ void loop() {
         restZ = quietSumZ / quietSamples;
         armed = true;
         positiveSamples = negativeSamples = 0;
+        rightSamples = leftSamples = 0;
         Serial.println("Armed. Ready for next flick.");
       }
     } else {
@@ -260,9 +282,25 @@ void loop() {
   // Two consecutive samples reject isolated spikes.
   positiveSamples = vertical > TRIGGER_MS2 ? positiveSamples + 1 : 0;
   negativeSamples = vertical < -TRIGGER_MS2 ? negativeSamples + 1 : 0;
-  if (positiveSamples >= 2 || negativeSamples >= 2) {
-    Serial.println(positiveSamples >= 2 ? "FLICK UP" : "FLICK DOWN");
-    sendGesture(positiveSamples >= 2);
+  rightSamples = side > TRIGGER_SIDE_MS2 ? rightSamples + 1 : 0;
+  leftSamples = side < -TRIGGER_SIDE_MS2 ? leftSamples + 1 : 0;
+
+  // If both an up/down and a left/right flick qualify, the stronger one
+  // (relative to its own threshold) wins.
+  const float verticalStrength = fabsf(vertical) / TRIGGER_MS2;
+  const float sideStrength = fabsf(side) / TRIGGER_SIDE_MS2;
+  const bool verticalHit = positiveSamples >= 2 || negativeSamples >= 2;
+  const bool sideHit = rightSamples >= 2 || leftSamples >= 2;
+  if (verticalHit || sideHit) {
+    int32_t command;
+    if (verticalHit && (!sideHit || verticalStrength >= sideStrength)) {
+      command = positiveSamples >= 2 ? FLICK_UP_COMMAND : FLICK_DOWN_COMMAND;
+      Serial.println(command == FLICK_UP_COMMAND ? "FLICK UP" : "FLICK DOWN");
+    } else {
+      command = rightSamples >= 2 ? FLICK_RIGHT_COMMAND : FLICK_LEFT_COMMAND;
+      Serial.println(command == FLICK_RIGHT_COMMAND ? "FLICK RIGHT" : "FLICK LEFT");
+    }
+    sendGesture(command);
     lastGesture = now;
     armed = false;
     quietTiming = false;
