@@ -12,12 +12,17 @@ constexpr int SDA_PIN = 21;
 constexpr int SCL_PIN = 22;
 constexpr uint32_t SAMPLE_MS = 10;  // About 100 readings per second.
 constexpr float TRIGGER_MS2 = 6.0f; // Lower = more sensitive.
-constexpr float TRIGGER_SIDE_MS2 = 6.0f; // Left/right sensitivity. Lower = more sensitive.
+constexpr float TRIGGER_SIDE_MS2 = 4.0f; // Left/right sensitivity. Lower = more sensitive.
+// When a flick has both an up/down and a left/right part, up/down must be this
+// many times stronger (relative to its threshold) to win. Raise it if
+// left/right flicks keep being read as up/down.
+constexpr float VERTICAL_WIN_RATIO = 1.5f;
 constexpr float QUIET_MS2 = 1.0f;
 constexpr float STILL_CHANGE_MS2 = 0.8f;
 constexpr uint32_t COOLDOWN_MS = 450;
 constexpr uint32_t QUIET_TIME_MS = 200;
-constexpr bool PRINT_READINGS = false; // true: also print X/Y/Z for debugging.
+constexpr bool PRINT_READINGS = false; // true: continuously print X/Y/Z for debugging.
+constexpr bool PRINT_SNAPSHOT = true;  // true: print one readings snapshot each time a command is sent.
 
 // Original receiver address: verify against the RECEIVER's Serial Monitor.
 uint8_t receiverMAC[] = {0x30, 0x76, 0xF5, 0x91, 0xF3, 0x50};
@@ -26,10 +31,14 @@ constexpr int32_t FLICK_UP_COMMAND = 1;
 constexpr int32_t FLICK_DOWN_COMMAND = -1;
 constexpr int32_t FLICK_RIGHT_COMMAND = 2;   // Receiver must handle these two.
 constexpr int32_t FLICK_LEFT_COMMAND = -2;
-// Sensor axis that points to your RIGHT when held normally. If left and
-// right come out swapped, change 1.0f to -1.0f. If the sensor is mounted so
-// its Y axis points right instead, use {0, 1, 0}.
-constexpr float RIGHT_AXIS[3] = {1.0f, 0.0f, 0.0f};
+// Sensor axis that points to your RIGHT when held normally. Tilting the
+// sensor up/down moved X readings, so X points forward, not sideways: the
+// sideways axis is Y (assuming the sensor lies flat). If left and right come
+// out swapped, use {0, -1, 0}. If it is mounted another way, try {1,0,0}/{0,0,1}.
+constexpr float RIGHT_AXIS[3] = {0.0f, 1.0f, 0.0f};
+// Tilt compensation: gravity direction is tracked with the gyro so tilting the
+// sensor is not mistaken for a flick. Lower = trusts the gyro more.
+constexpr float GRAVITY_BLEND = 0.02f;
 static_assert(sizeof(int32_t) == 4, "Gesture packets must be four bytes");
 std::atomic<int> sendResult{-1};
 bool sendInFlight = false;
@@ -89,6 +98,8 @@ void sendGesture(int32_t command) {
 
 Adafruit_MPU6050 mpu;
 float restX, restY, restZ;
+float gEstX, gEstY, gEstZ;   // Tracked gravity direction (sensor frame).
+uint32_t lastFilterUs = 0;
 float quietX, quietY, quietZ;
 float quietSumX, quietSumY, quietSumZ;
 uint32_t quietSamples = 0;
@@ -104,6 +115,10 @@ uint32_t lastSample = 0;
 uint32_t lastGesture = 0;
 uint32_t quietSince = 0;
 uint32_t lastDebug = 0;
+// Previous sample, so a snapshot shows the last two readings before a trigger.
+float prevX = 0, prevY = 0, prevZ = 0, prevVertical = 0, prevSide = 0;
+// Strongest readings seen since the sensor was last armed.
+float peakVertical = 0, peakSide = 0;
 
 // Calibration needs one continuous second of nearly unchanged readings.
 bool calibrate() {
@@ -187,6 +202,8 @@ void setup() {
   }
   ready = true;
   gravityMagnitude = sqrtf(restX*restX + restY*restY + restZ*restZ);
+  gEstX = restX; gEstY = restY; gEstZ = restZ;
+  lastFilterUs = micros();
   Serial.println("Ready! Flick UP, DOWN, LEFT or RIGHT without twisting the sensor.");
 }
 
@@ -206,18 +223,32 @@ void loop() {
     return;
   }
 
-  const float dx = a.acceleration.x - restX;
-  const float dy = a.acceleration.y - restY;
-  const float dz = a.acceleration.z - restZ;
-  const float restMagnitude = sqrtf(restX*restX + restY*restY + restZ*restZ);
-  // At rest the accelerometer points upward. Project the change onto that
-  // direction, so the sensor need not be mounted with a particular axis up.
-  const float vertical = (dx*restX + dy*restY + dz*restZ) / restMagnitude;
-  // Sideways direction: the RIGHT_AXIS with its gravity component removed, so
-  // it lies flat (horizontal) whatever the tilt. Left/right = change along it.
-  const float ux = restX / restMagnitude;
-  const float uy = restY / restMagnitude;
-  const float uz = restZ / restMagnitude;
+  // Track gravity: rotate the estimate by the gyro (so tilting is followed),
+  // then blend slowly toward the accelerometer to remove gyro drift.
+  const uint32_t nowUs = micros();
+  float dt = (nowUs - lastFilterUs) * 1e-6f;
+  lastFilterUs = nowUs;
+  if (dt > 0.05f) dt = 0.05f;
+  const float wx = g.gyro.x, wy = g.gyro.y, wz = g.gyro.z;
+  const float gx0 = gEstX, gy0 = gEstY, gz0 = gEstZ;
+  gEstX = gx0 - (wy*gz0 - wz*gy0) * dt;
+  gEstY = gy0 - (wz*gx0 - wx*gz0) * dt;
+  gEstZ = gz0 - (wx*gy0 - wy*gx0) * dt;
+  gEstX += (a.acceleration.x - gEstX) * GRAVITY_BLEND;
+  gEstY += (a.acceleration.y - gEstY) * GRAVITY_BLEND;
+  gEstZ += (a.acceleration.z - gEstZ) * GRAVITY_BLEND;
+
+  // Linear (hand) acceleration = measured minus tracked gravity.
+  const float dx = a.acceleration.x - gEstX;
+  const float dy = a.acceleration.y - gEstY;
+  const float dz = a.acceleration.z - gEstZ;
+  const float gMagnitude = sqrtf(gEstX*gEstX + gEstY*gEstY + gEstZ*gEstZ);
+  const float ux = gEstX / gMagnitude;   // Unit vector pointing up.
+  const float uy = gEstY / gMagnitude;
+  const float uz = gEstZ / gMagnitude;
+  const float vertical = dx*ux + dy*uy + dz*uz;
+  // Sideways direction: RIGHT_AXIS with its up component removed, so it lies
+  // flat whatever the tilt. Left/right = linear acceleration along it.
   const float axisDotUp = RIGHT_AXIS[0]*ux + RIGHT_AXIS[1]*uy + RIGHT_AXIS[2]*uz;
   const float rx = RIGHT_AXIS[0] - axisDotUp*ux;
   const float ry = RIGHT_AXIS[1] - axisDotUp*uy;
@@ -268,9 +299,13 @@ void loop() {
         restX = quietSumX / quietSamples;
         restY = quietSumY / quietSamples;
         restZ = quietSumZ / quietSamples;
+        gEstX = restX; gEstY = restY; gEstZ = restZ;  // Resync while still.
         armed = true;
         positiveSamples = negativeSamples = 0;
         rightSamples = leftSamples = 0;
+        peakVertical = peakSide = 0;
+        prevX = a.acceleration.x; prevY = a.acceleration.y; prevZ = a.acceleration.z;
+        prevVertical = prevSide = 0;
         Serial.println("Armed. Ready for next flick.");
       }
     } else {
@@ -278,6 +313,9 @@ void loop() {
     }
     return;
   }
+
+  if (fabsf(vertical) > fabsf(peakVertical)) peakVertical = vertical;
+  if (fabsf(side) > fabsf(peakSide)) peakSide = side;
 
   // Two consecutive samples reject isolated spikes.
   positiveSamples = vertical > TRIGGER_MS2 ? positiveSamples + 1 : 0;
@@ -293,16 +331,37 @@ void loop() {
   const bool sideHit = rightSamples >= 2 || leftSamples >= 2;
   if (verticalHit || sideHit) {
     int32_t command;
-    if (verticalHit && (!sideHit || verticalStrength >= sideStrength)) {
+    if (verticalHit && (!sideHit || verticalStrength >= sideStrength * VERTICAL_WIN_RATIO)) {
       command = positiveSamples >= 2 ? FLICK_UP_COMMAND : FLICK_DOWN_COMMAND;
       Serial.println(command == FLICK_UP_COMMAND ? "FLICK UP" : "FLICK DOWN");
     } else {
       command = rightSamples >= 2 ? FLICK_RIGHT_COMMAND : FLICK_LEFT_COMMAND;
       Serial.println(command == FLICK_RIGHT_COMMAND ? "FLICK RIGHT" : "FLICK LEFT");
     }
+    if (PRINT_SNAPSHOT) {
+      Serial.println("---- SNAPSHOT at send ----");
+      Serial.printf("Command: %ld\n", static_cast<long>(command));
+      Serial.printf("Previous sample: X:%.2f Y:%.2f Z:%.2f Vertical:%.2f Side:%.2f\n",
+                    prevX, prevY, prevZ, prevVertical, prevSide);
+      Serial.printf("Trigger sample:  X:%.2f Y:%.2f Z:%.2f Vertical:%.2f Side:%.2f\n",
+                    a.acceleration.x, a.acceleration.y, a.acceleration.z, vertical, side);
+      Serial.printf("Gyro: X:%.2f Y:%.2f Z:%.2f rad/s\n",
+                    g.gyro.x, g.gyro.y, g.gyro.z);
+      Serial.printf("Tracked gravity: X:%.2f Y:%.2f Z:%.2f\n", gEstX, gEstY, gEstZ);
+      Serial.printf("Peaks since armed: Vertical:%.2f Side:%.2f\n", peakVertical, peakSide);
+      Serial.printf("Strength vs threshold: Vertical:%.2f Side:%.2f | counts up:%u down:%u right:%u left:%u\n",
+                    verticalStrength, sideStrength,
+                    positiveSamples, negativeSamples, rightSamples, leftSamples);
+      Serial.println("--------------------------");
+    }
     sendGesture(command);
     lastGesture = now;
     armed = false;
     quietTiming = false;
   }
+  prevX = a.acceleration.x;
+  prevY = a.acceleration.y;
+  prevZ = a.acceleration.z;
+  prevVertical = vertical;
+  prevSide = side;
 }
