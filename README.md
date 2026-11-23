@@ -6,41 +6,55 @@ classic ESP32 board with a USB-to-serial bridge described below.
 
 ## Current board: classic ESP32 + MPU6050
 
-### Wireless gesture sender
+### Wrist controlled brightness slider and animations
 
-`sender_espnow/sender_espnow.ino` now combines the working MPU6050 detector with
-ESP-NOW on the **classic ESP32** (SDA 21, SCL 22). It replaces the old C3 BOOT
-button sender. The standalone `gesture_test_esp32` sketch remains available.
-Use **esp32 by Espressif Systems 3.3.12**, the version used for the successful
-sensor test; the send callback signature depends on the core/ESP-IDF version.
+The combined sketches are in `gesture_slider_sender` and
+`gesture_slider_receiver`. Use the original `sender_espnow` and
+`receiver_espnow` sketches for the original flick controls.
 
-1. Upload `receiver_espnow/receiver_espnow.ino` to the **receiver C3**, using
-   **ESP32C3 Dev Module** and **USB CDC On Boot > Enabled**. Open its Serial
-   Monitor at 115200 and press RESET to read **This receiver's MAC address**.
-2. Put that address in `receiverMAC` near the top of the sender sketch. The
-   existing `70:AF:09:0D:D0:A8` is retained from the original sender and must be
-   verified; do not replace it with the new sender's own MAC.
-3. Upload `sender_espnow/sender_espnow.ino` to the sensor-equipped **classic
-   ESP32**, using **ESP32 Dev Module** and its COM port. Wiring stays as below.
-4. Power both boards. No router is required. Both sketches explicitly use
-   **radio channel 1**. Hold the MPU6050 still for calibration, then flick and
-   pause until the sender reports `Armed. Ready for next flick.`.
-5. Check the sender for `Queued gesture command: 1` (up) or `-1` (down), followed
-   by `Send OK`. Check the receiver for `Received: FLICK UP (1)` or
-   `Received: FLICK DOWN (-1)` and an onboard LED flash.
+The hand unit starts with the slider locked. Hold your hand still at power-on
+for calibration. With the MPU6050 on the back of the hand, roll your wrist
+about the wrist-to-fingertip axis until the sender prints `SLIDER ON`. Move your
+whole hand up and the lamp brightens by 15 levels every 50 ms while upward
+motion is detected. Lower your hand for the same steps downward. Hand speed
+does not change the step size or rate. The brightness holds when movement stops,
+and you can reverse direction without pausing. A hard sideways flick with a
+quick stop picks the next or previous animation during the slide. Roll your wrist
+again to lock the hand controls at the current brightness and animation setting.
+A deliberate twist in either direction toggles the mode. Turn back slowly if
+you are just resetting your hand position.
 
-The payload is one four-byte signed integer: **1 = up**, **-1 = down**. The old
-integer receiver can print these values too; the updated receiver names the
-gestures, validates packet length, and keeps work outside the Wi-Fi callback.
-`Send OK` means radio delivery, not confirmation that a lamp changed state.
-There are no automatic retries or application acknowledgements in this prototype.
-If delivery fails, check receiver power, its station MAC, and matching channels.
-The receiver LED is GPIO8, active-low, for the original C3 board; other receiver
-boards need their LED configuration checked. Actual lamp output remains to be
-implemented once its driver/pin wiring and desired gesture actions are known.
+Mount the MPU6050's X axis along the hand. If the Y axis runs along your hand,
+change `WRIST_ROLL_AXIS` from `0` to `1` in the sender before uploading. If the
+sideways gestures are reversed, set `SIDE_SIGN` to `-1`. The
+MPU6050 estimates movement direction from acceleration. Very slow movements may
+not register.
 
-The combined wireless sketches still require compilation and a two-board
-hardware test. Reference: [Espressif ESP-NOW documentation](https://docs.espressif.com/projects/esp-idf/en/v5.5.6/esp32c3/api-reference/network/esp_now.html).
+1. In Arduino IDE use **esp32 by Espressif Systems 3.3.12** and select the
+   lamp receiver's board and COM port. The current GPIO23 lamp receiver uses
+   **ESP32 Dev Module**. Upload `gesture_slider_receiver/gesture_slider_receiver.ino`.
+   The updated receiver prints `Brightness adjusts in every animation mode.`
+2. Open the receiver's Serial Monitor at **115200 baud** and reset it to check
+   its station MAC address. If it differs from the address in `receiverMAC`,
+   update that value in the sender.
+3. Select **ESP32 Dev Module** and the hand unit's COM port. Upload
+   `gesture_slider_sender/gesture_slider_sender.ino`. The MPU6050 uses SDA 21 and SCL 22 as below.
+4. Lift and lower your hand in one continuous motion and flick sideways during
+   the movement. Lock it with another twist and verify that hand motion leaves
+   both settings alone.
+   Repeat after powering both boards from their standalone supplies.
+
+Upload each updated sketch once over USB with its board's external supply
+disconnected. Unplug USB before reconnecting that supply. The ESP32 keeps its
+firmware in flash and can then run without a laptop. Both boards use ESP-NOW
+channel 1 and can talk directly.
+
+The slider scales the animation's whole brightness range without changing its
+timing or mode. The selected brightness sets the peak, and zero turns the lamp
+off in any mode. An animation continues while the slider is locked. To check
+this over USB, enter `a3` in the receiver's Serial Monitor and compare `256`
+with `768` while the breathing effect plays. Serial commands and the legacy
+receiver commands remain available.
 
 ### Standalone sensor test
 
