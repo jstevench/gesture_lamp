@@ -1,5 +1,5 @@
 // ESP32 ESP-NOW gesture receiver driving an LED through a MOSFET.
-// The hand slider sends small brightness changes. Older senders can still
+// The hand controller sends absolute brightness targets. Older senders can still
 // send up/down steps and right/left animation commands.
 // Serial Monitor also works for testing: 0-1023 sets peak power, a0-a6 picks an
 // animation (a0 = steady), s = stop animation.
@@ -18,6 +18,7 @@ constexpr int32_t FLICK_DOWN_COMMAND = -1;
 constexpr int32_t FLICK_RIGHT_COMMAND = 2;
 constexpr int32_t FLICK_LEFT_COMMAND = -2;
 constexpr int32_t SLIDER_DELTA_BASE = 10000;
+constexpr int32_t BRIGHTNESS_SET_BASE = 12000;
 
 constexpr int PWM_PIN = 23;          // to MOSFET gate (through 220 ohm)
 constexpr int PWM_FREQ = 20000;
@@ -134,6 +135,11 @@ void renderLamp() {
 // ---------------- Input handling ----------------
 
 void handleGesture(int32_t command) {
+  if (command >= BRIGHTNESS_SET_BASE && command <= BRIGHTNESS_SET_BASE + PWM_MAX) {
+    const int power = command - BRIGHTNESS_SET_BASE;
+    if (power != currentPower) setPower(power);
+    return;
+  }
   if (command >= SLIDER_DELTA_BASE - PWM_MAX && command <= SLIDER_DELTA_BASE + PWM_MAX) {
     const int delta = command - SLIDER_DELTA_BASE;
     const int power = constrain(currentPower + delta, 0, PWM_MAX);
@@ -217,7 +223,7 @@ void setup() {
   }
   ready = true;
   Serial.println("Ready. Waiting for gestures on channel 1...");
-  Serial.println("Ready for brightness slider and legacy gesture commands.");
+  Serial.println("Ready for palm-angle brightness and legacy gesture commands.");
   Serial.println("Brightness adjusts in every animation mode.");
   Serial.printf("Serial: 0-%d sets power, a0-a%d picks an animation, s = stop.\n",
                 PWM_MAX, ANIM_COUNT - 1);

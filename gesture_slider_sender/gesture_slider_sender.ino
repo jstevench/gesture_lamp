@@ -15,48 +15,80 @@ constexpr uint8_t RADIO_CHANNEL = 1;
 uint8_t receiverMAC[] = {0x30, 0x76, 0xF5, 0x91, 0xF3, 0x50};
 
 // Keep these wire values in sync with gesture_slider_receiver.
-constexpr int32_t SLIDER_DELTA_BASE = 10000;
+constexpr int32_t BRIGHTNESS_SET_BASE = 12000;
+constexpr int PWM_MAX = 1023;
 constexpr int32_t FLICK_RIGHT_COMMAND = 2;
 constexpr int32_t FLICK_LEFT_COMMAND = -2;
-constexpr int BRIGHTNESS_STEP = 15;
-constexpr uint32_t BRIGHTNESS_STEP_INTERVAL_MS = 50;
+constexpr uint32_t BRIGHTNESS_UPDATE_MS = 50;
+constexpr uint32_t BRIGHTNESS_REFRESH_MS = 750;
+constexpr float PALM_ENDPOINT_DEG = 1.0f;
 
 // Mount sensor X along the hand (wrist to fingertips). Set to 1 if Y is
-// along the hand instead. Either direction of the twist toggles the slider.
-constexpr uint8_t WRIST_ROLL_AXIS = 0;
+// along the hand instead, so the sideways projection follows the mounting.
+constexpr uint8_t HAND_FORWARD_AXIS = 0;
+constexpr uint8_t HAND_SIDE_AXIS = HAND_FORWARD_AXIS == 0 ? 1 : 0;
 constexpr int SIDE_SIGN = 1; // Change to -1 if left and right are swapped.
-constexpr float SIDE_FLICK_START_MS2 = 8.0f;
-constexpr float SIDE_FLICK_BRAKE_MS2 = 3.2f;
-constexpr float SIDE_QUIET_MS2 = 1.1f;
-constexpr uint8_t SIDE_START_SAMPLES = 3;
-constexpr uint8_t SIDE_BRAKE_SAMPLES = 2;
-constexpr uint32_t SIDE_FLICK_WINDOW_MS = 220;
-constexpr uint32_t SIDE_COOLDOWN_MS = 450;
-constexpr float TWIST_START_RAD_S = 1.5f;
-constexpr float TWIST_CONTINUE_RAD_S = 0.75f;
-constexpr float TWIST_ANGLE_RAD = 0.58f;
-constexpr uint32_t TWIST_WINDOW_MS = 650;
-constexpr uint32_t TWIST_COOLDOWN_MS = 650;
-constexpr uint32_t ROTATION_SETTLE_MS = 180;
+constexpr float LOCK_LIFT_MS2 = 2.4f;
+constexpr float LOCK_PITCH_RAD_S = 2.6f;
+constexpr float LOCK_LIFT_MAX_ROLL_RAD_S = 1.7f;
+constexpr uint8_t LOCK_FLICK_SAMPLES = 3;
+constexpr uint32_t LOCK_COOLDOWN_MS = 450;
+constexpr uint8_t LOCK_QUIET_SAMPLES = 6;
+constexpr uint32_t SIDE_SETTLE_AFTER_LOCK_MS = 150;
 
-constexpr float VERTICAL_FILTER_S = 0.040f;
-constexpr float VERTICAL_ACCEL_DEADBAND = 0.20f; // m/s²
-constexpr float MAX_VERTICAL_ACCEL = 6.0f;      // m/s²
-constexpr float VERTICAL_START_SPEED = 0.050f;  // m/s
-constexpr float VERTICAL_STOP_SPEED = 0.028f;   // m/s
-constexpr float VERTICAL_REVERSE_SPEED = 0.065f;
-constexpr float DIRECTION_ACCEL_MS2 = 0.06f;
-constexpr float MAX_VERTICAL_SPEED = 0.80f;     // m/s
-constexpr float VELOCITY_DECAY_S = 2.60f;
-constexpr float QUIET_DECAY_S = 0.11f;
-constexpr float BRAKE_START_MS2 = 0.12f;
-constexpr float GENTLE_BRAKE_MAX_MS2 = 0.85f;
-constexpr float REVERSAL_DECAY_S = 0.23f;
-constexpr float BRAKE_CONFIRM_S = 0.040f;
-constexpr uint32_t VERTICAL_QUIET_MS = 260;
-constexpr uint32_t VERTICAL_REARM_MS = 180;
-constexpr uint32_t VERTICAL_CONFIRM_MS = 30;
-constexpr uint32_t VERTICAL_REVERSE_CONFIRM_MS = 45;
+struct FlickDetector {
+  float startMs2;
+  float brakeMs2;
+  float quietMs2;
+  int direction = 0;
+  uint8_t startSamples = 0;
+  uint8_t brakeSamples = 0;
+  uint32_t startedMs = 0;
+  uint32_t lastFlickMs = 0;
+  bool latched = false;
+
+  void clearCandidate() {
+    direction = 0;
+    startSamples = brakeSamples = 0;
+  }
+
+  int update(float acceleration, uint32_t now, bool allowed) {
+    const float strength = fabsf(acceleration);
+    if (latched) {
+      if (now - lastFlickMs >= 450 && strength <= quietMs2) latched = false;
+      return 0;
+    }
+    if (!allowed) {
+      clearCandidate();
+      return 0;
+    }
+    if (startSamples < 3) {
+      const int next = strength < startMs2 ? 0 : (acceleration > 0.0f ? 1 : -1);
+      if (next != direction) startSamples = 0;
+      direction = next;
+      if (direction != 0 && ++startSamples == 3) startedMs = now;
+      return 0;
+    }
+    if (now - startedMs > 220) {
+      clearCandidate();
+      return 0;
+    }
+    // The first burst determines direction. Its braking pulse completes the flick.
+    if (acceleration * direction > -brakeMs2) {
+      brakeSamples = 0;
+      return 0;
+    }
+    if (++brakeSamples < 2) return 0;
+
+    const int result = direction;
+    lastFlickMs = now;
+    latched = true;
+    clearCandidate();
+    return result;
+  }
+};
+
+FlickDetector sideFlick{8.0f, 3.2f, 1.1f};
 
 Adafruit_MPU6050 mpu;
 uint8_t sensorAddress = 0x68;
@@ -64,32 +96,15 @@ bool ready = false;
 float gravity[3] = {};
 float gyroBias[3] = {};
 float gravityMagnitude = 0.0f;
-float sideMountSign = 1.0f;
+float palmDownSign = 1.0f;
 uint32_t lastSampleUs = 0;
 
-bool sliderEnabled = false;
-bool twistLatched = false;
-float twistAngle = 0.0f;
-uint32_t twistStartedMs = 0;
-uint32_t lastTwistMs = 0;
-uint32_t lastRotationMs = 0;
-
-float filteredVertical = 0.0f;
-float verticalSpeed = 0.0f;
-int brightnessDirection = 0;
-int lastBrightnessDirection = 0;
-int brightnessCandidate = 0;
-float brakingSeconds = 0.0f;
-uint32_t brightnessCandidateMs = 0;
-uint32_t lastVerticalMotionMs = 0;
-int sideCandidate = 0;
-uint8_t sideStartSamples = 0;
-uint8_t sideBrakeSamples = 0;
-uint32_t sideStartedMs = 0;
-bool sideLatched = false;
-uint32_t lastSideFlickMs = 0;
+bool controlsEnabled = false;
+uint32_t lastLockToggleMs = 0;
 int32_t pendingAnimation = 0;
-uint32_t lastBrightnessStepMs = 0;
+int brightnessTarget = 0;
+int lastDeliveredBrightness = -1;
+uint32_t lastBrightnessSendMs = 0;
 uint32_t lastDeliveryLogMs = 0;
 int32_t lastSentCommand = 0;
 
@@ -135,17 +150,19 @@ void sendCommand(int32_t command) {
 }
 
 void sendPendingCommand(uint32_t now) {
-  if (!sliderEnabled || now - lastTwistMs < ROTATION_SETTLE_MS || sendInFlight) return;
+  if (!controlsEnabled || sendInFlight) return;
   if (pendingAnimation != 0) {
     const int32_t command = pendingAnimation;
     pendingAnimation = 0;
     sendCommand(command);
     return;
   }
-  if (brightnessDirection == 0 || now - lastBrightnessStepMs < BRIGHTNESS_STEP_INTERVAL_MS) return;
-  // Send one fixed step at the current cadence. Never queue missed steps.
-  lastBrightnessStepMs = now;
-  sendCommand(SLIDER_DELTA_BASE + brightnessDirection * BRIGHTNESS_STEP);
+  const uint32_t sinceBrightness = now - lastBrightnessSendMs;
+  if (sinceBrightness < BRIGHTNESS_UPDATE_MS) return;
+  if (brightnessTarget == lastDeliveredBrightness && sinceBrightness < BRIGHTNESS_REFRESH_MS) return;
+  // An absolute refresh is safe to repeat if a packet was missed.
+  lastBrightnessSendMs = now;
+  sendCommand(BRIGHTNESS_SET_BASE + brightnessTarget);
 }
 
 bool readMotion(float accel[3], float gyro[3]) {
@@ -175,14 +192,16 @@ float length(const float v[3]) {
 }
 
 bool calibrate() {
-  Serial.println("Hold your hand still for calibration.");
+  Serial.println("Hold your palm down and still for calibration.");
   float accelSum[3] = {}, gyroSum[3] = {};
   int count = 0;
   const uint32_t start = millis();
   while (millis() - start < 15000) {
     float accel[3], gyro[3];
     if (!readMotion(accel, gyro)) return false;
-    if (fabsf(length(accel) - 9.80665f) > 1.0f || length(gyro) > 0.35f) {
+    const float magnitude = length(accel);
+    if (fabsf(magnitude - 9.80665f) > 1.0f || length(gyro) > 0.35f ||
+        fabsf(accel[2]) < 0.85f * magnitude) {
       count = 0;
       for (size_t i = 0; i < 3; ++i) accelSum[i] = gyroSum[i] = 0.0f;
     } else {
@@ -196,7 +215,7 @@ bool calibrate() {
           gyroBias[i] = gyroSum[i] / count;
         }
         gravityMagnitude = length(gravity);
-        sideMountSign = gravity[2] >= 0.0f ? SIDE_SIGN : -SIDE_SIGN;
+        palmDownSign = gravity[2] >= 0.0f ? 1.0f : -1.0f;
         return gravityMagnitude > 8.0f;
       }
     }
@@ -213,10 +232,10 @@ void measureHandAcceleration(const float accel[3], const float gyro[3], float ro
   gravity[1] -= (gyro[2]*gx - gyro[0]*gz) * dt;
   gravity[2] -= (gyro[0]*gy - gyro[1]*gx) * dt;
 
-  // Only correct gyro drift when acceleration is close to gravity.
-  if (fabsf(verticalSpeed) < VERTICAL_STOP_SPEED && rotation < 0.55f &&
-      fabsf(length(accel) - gravityMagnitude) < 0.30f) {
-    for (size_t i = 0; i < 3; ++i) gravity[i] += (accel[i] - gravity[i]) * 0.045f;
+  // Correct gyro drift gently when the accelerometer is close to 1 g.
+  // The gyro carries the orientation estimate during turns and sharp flicks.
+  if (rotation < 0.55f && fabsf(length(accel) - gravityMagnitude) < 0.30f) {
+    for (size_t i = 0; i < 3; ++i) gravity[i] += (accel[i] - gravity[i]) * 0.025f;
   }
   const float scale = gravityMagnitude / length(gravity);
   for (size_t i = 0; i < 3; ++i) gravity[i] *= scale;
@@ -226,149 +245,90 @@ void measureHandAcceleration(const float accel[3], const float gyro[3], float ro
 
   // Use the horizontal direction across the hand. This remains usable after
   // a wrist roll, even if the sensor's sideways axis now points straight up.
-  const uint8_t crossAxis = WRIST_ROLL_AXIS == 0 ? 1 : 0;
-  const float horizontalLength = hypotf(gravity[crossAxis], gravity[2]);
+  const float horizontalLength = hypotf(gravity[HAND_SIDE_AXIS], gravity[2]);
   side = horizontalLength > 0.3f * gravityMagnitude
-      ? sideMountSign * (accel[crossAxis]*gravity[2] - accel[2]*gravity[crossAxis]) /
+      ? SIDE_SIGN * palmDownSign * (accel[HAND_SIDE_AXIS]*gravity[2] - accel[2]*gravity[HAND_SIDE_AXIS]) /
           horizontalLength : 0.0f;
 }
 
-void resetHandControls(uint32_t now) {
-  filteredVertical = 0.0f;
-  verticalSpeed = 0.0f;
-  brightnessDirection = 0;
-  lastBrightnessDirection = 0;
-  brightnessCandidate = 0;
-  brakingSeconds = 0.0f;
-  lastVerticalMotionMs = now;
-  sideCandidate = 0;
-  sideStartSamples = sideBrakeSamples = 0;
-  sideLatched = false;
+float palmAngle() {
+  // Gravity projected onto the palm normal gives 0..180 degrees for either
+  // roll direction, without accumulating hand travel or roll angle over time.
+  const float cosine = constrain(palmDownSign * gravity[2] / gravityMagnitude, -1.0f, 1.0f);
+  return acosf(cosine) * RAD_TO_DEG;
 }
 
-void updateTwist(float roll, float rotation, float dt, uint32_t now) {
-  if (rotation > TWIST_CONTINUE_RAD_S) lastRotationMs = now;
-  if (twistLatched) {
-    if (now - lastTwistMs >= TWIST_COOLDOWN_MS && now - lastRotationMs >= ROTATION_SETTLE_MS) {
-      twistLatched = false;
-    }
-    return;
-  }
-
-  const float speed = fabsf(roll);
-  if (speed < TWIST_CONTINUE_RAD_S || speed < rotation * 0.75f ||
-      (twistAngle != 0.0f && (now - twistStartedMs > TWIST_WINDOW_MS || twistAngle * roll < 0))) {
-    twistAngle = 0.0f;
-    return;
-  }
-  if (twistAngle == 0.0f) {
-    if (speed < TWIST_START_RAD_S) return;
-    twistStartedMs = now;
-  }
-  twistAngle += roll * dt;
-  if (fabsf(twistAngle) < TWIST_ANGLE_RAD) return;
-
-  sliderEnabled = !sliderEnabled;
-  twistLatched = true;
-  lastTwistMs = now;
-  twistAngle = 0.0f;
-  pendingAnimation = 0;
-  resetHandControls(now);
-  Serial.println(sliderEnabled ? "SLIDER ON: +/-15 every 50 ms while moving. Flick left/right for animations."
-                               : "SLIDER LOCKED: hand gestures paused.");
+int palmBrightness(float angle) {
+  if (angle <= PALM_ENDPOINT_DEG) return 0;
+  if (angle >= 180.0f - PALM_ENDPOINT_DEG) return PWM_MAX;
+  return lroundf(angle * (PWM_MAX / 180.0f));
 }
 
-void updateBrightness(float vertical, float dt, uint32_t now) {
-  filteredVertical += (vertical - filteredVertical) * dt / (VERTICAL_FILTER_S + dt);
-  const float accel = copysignf(constrain(fabsf(filteredVertical) - VERTICAL_ACCEL_DEADBAND,
-      0.0f, MAX_VERTICAL_ACCEL), filteredVertical);
-  if (fabsf(accel) >= DIRECTION_ACCEL_MS2) lastVerticalMotionMs = now;
-  const uint32_t quietMs = now - lastVerticalMotionMs;
-
-  const float opposingAccel = -lastBrightnessDirection * accel;
-  const bool braking = opposingAccel >= BRAKE_START_MS2;
-  brakingSeconds = braking ? brakingSeconds + dt : 0.0f;
-  float decay = VELOCITY_DECAY_S;
-  if (quietMs >= VERTICAL_QUIET_MS) {
-    decay = QUIET_DECAY_S;
-  } else if (braking && opposingAccel <= GENTLE_BRAKE_MAX_MS2 &&
-             lastBrightnessDirection * verticalSpeed > 0.0f) {
-    // A gentle reversal must not spend a long time cancelling stale speed.
-    // With hard braking, keep the measured impulse to avoid a false reversal.
-    decay = REVERSAL_DECAY_S;
+void updateHandControls(float vertical, float side, const float gyro[3], uint32_t now) {
+  static bool flickArmed = true;
+  static uint8_t flickSamples = 0;
+  static uint8_t quietSamples = 0;
+  const float lift = fabsf(vertical);
+  const float pitch = fabsf(gyro[HAND_SIDE_AXIS]);
+  const float roll = fabsf(gyro[HAND_FORWARD_AXIS]);
+  // A quick lift/drop or a bend of the wrist can toggle the lock. A palm
+  // roll is around the wrist-to-fingertip axis and only adjusts brightness.
+  const bool liftBurst = lift >= LOCK_LIFT_MS2 && lift >= 1.10f * fabsf(side) &&
+      roll <= LOCK_LIFT_MAX_ROLL_RAD_S;
+  const bool pitchBurst = pitch >= LOCK_PITCH_RAD_S && pitch >= 1.35f * max(roll, fabsf(gyro[2]));
+  if (flickArmed) {
+    flickSamples = (liftBurst || pitchBurst) ? flickSamples + 1 : 0;
+  } else {
+    const bool quiet = now - lastLockToggleMs >= LOCK_COOLDOWN_MS && lift < 0.9f && pitch < 0.7f;
+    quietSamples = quiet ? quietSamples + 1 : 0;
+    flickArmed = quietSamples >= LOCK_QUIET_SAMPLES;
   }
-  verticalSpeed = constrain((verticalSpeed + accel * dt) /
-      (1.0f + dt / decay), -MAX_VERTICAL_SPEED, MAX_VERTICAL_SPEED);
-
-  // Stop the old steps before waiting for the new direction to qualify.
-  const float speed = fabsf(verticalSpeed);
-  if (brightnessDirection != 0 &&
-      (brightnessDirection * verticalSpeed <= VERTICAL_STOP_SPEED || brakingSeconds >= BRAKE_CONFIRM_S)) {
-    brightnessDirection = 0;
+  if (flickSamples == LOCK_FLICK_SAMPLES) {
+    flickArmed = false;
+    flickSamples = quietSamples = 0;
+    controlsEnabled = !controlsEnabled;
+    lastLockToggleMs = now;
+    pendingAnimation = 0;
+    sideFlick.clearCandidate();
+    sideFlick.latched = false;
+    lastDeliveredBrightness = -1;
+    lastBrightnessSendMs = now - BRIGHTNESS_UPDATE_MS;
+    Serial.print("FLICK: ");
+    Serial.println(controlsEnabled ? "CONTROLS ON: palm angle sets brightness."
+                                   : "CONTROLS LOCKED: brightness and animation selection held.");
   }
-  if (quietMs >= VERTICAL_REARM_MS && speed <= VERTICAL_STOP_SPEED) lastBrightnessDirection = 0;
+  if (!controlsEnabled) return;
 
-  const int direction = verticalSpeed > 0.0f ? 1 : -1;
-  const bool reversing = lastBrightnessDirection != 0 && direction != lastBrightnessDirection;
-  const float threshold = reversing ? VERTICAL_REVERSE_SPEED : VERTICAL_START_SPEED;
-  if (direction == brightnessDirection || speed < threshold || direction * accel < DIRECTION_ACCEL_MS2) {
-    brightnessCandidate = 0;
-    return;
+  brightnessTarget = palmBrightness(palmAngle());
+  const bool sideAllowed = flickSamples == 0 && !pitchBurst &&
+      now - lastLockToggleMs >= SIDE_SETTLE_AFTER_LOCK_MS;
+  const int sideGesture = sideFlick.update(side, now, sideAllowed);
+  if (sideGesture != 0) {
+    pendingAnimation = sideGesture > 0 ? FLICK_RIGHT_COMMAND : FLICK_LEFT_COMMAND;
+    Serial.println(sideGesture > 0 ? "FLICK RIGHT: next animation." : "FLICK LEFT: previous animation.");
   }
-  if (direction != brightnessCandidate) {
-    brightnessCandidate = direction;
-    brightnessCandidateMs = now;
-    return;
-  }
-  const uint32_t confirmMs = reversing ? VERTICAL_REVERSE_CONFIRM_MS : VERTICAL_CONFIRM_MS;
-  if (now - brightnessCandidateMs < confirmMs) return;
-
-  brightnessDirection = direction;
-  lastBrightnessDirection = direction;
-  brightnessCandidate = 0;
-  brakingSeconds = 0.0f;
-  Serial.println(direction > 0 ? "Brightness sliding UP" : "Brightness sliding DOWN");
 }
 
-void updateSideFlick(float side, uint32_t now) {
-  // Sideways flicks use only the horizontal projection so a lift or lower
-  // can continue at the same time.
-  const float strength = fabsf(side);
-  if (sideLatched) {
-    // Only the sideways detector has a cooldown. Brightness keeps updating.
-    if (now - lastSideFlickMs >= SIDE_COOLDOWN_MS && strength <= SIDE_QUIET_MS2) {
-      sideLatched = false;
-    }
-    return;
+void printMotionDebug(float vertical, float side, const float gyro[3], uint32_t now) {
+  static bool enabled = false;
+  static uint32_t lastReportMs = 0;
+  static float peakLift = 0.0f, peakSide = 0.0f, peakPitch = 0.0f, peakRoll = 0.0f;
+  if (Serial.available() && Serial.read() == 'd') {
+    enabled = !enabled;
+    peakLift = peakSide = peakPitch = peakRoll = 0.0f;
+    lastReportMs = now;
+    Serial.println(enabled ? "Motion debug on (peaks every 250 ms)." : "Motion debug off.");
   }
-  if (sideStartSamples < SIDE_START_SAMPLES) {
-    const int direction = strength < SIDE_FLICK_START_MS2
-        ? 0 : (side > 0.0f ? 1 : -1);
-    if (direction != sideCandidate) sideStartSamples = 0;
-    sideCandidate = direction;
-    if (direction != 0 && ++sideStartSamples == SIDE_START_SAMPLES) sideStartedMs = now;
-    return;
-  }
-
-  if (now - sideStartedMs > SIDE_FLICK_WINDOW_MS) {
-    sideCandidate = 0;
-    sideStartSamples = sideBrakeSamples = 0;
-    return;
-  }
-  // A short sideways burst followed by braking is a more reliable flick
-  // than a single peak caused by tilt or spillover from a vertical lift.
-  if (side * sideCandidate > -SIDE_FLICK_BRAKE_MS2) {
-    sideBrakeSamples = 0;
-    return;
-  }
-  if (++sideBrakeSamples < SIDE_BRAKE_SAMPLES) return;
-
-  pendingAnimation = sideCandidate > 0 ? FLICK_RIGHT_COMMAND : FLICK_LEFT_COMMAND;
-  Serial.println(sideCandidate > 0 ? "FLICK RIGHT: next animation." : "FLICK LEFT: previous animation.");
-  lastSideFlickMs = now;
-  sideLatched = true;
-  sideCandidate = 0;
-  sideStartSamples = sideBrakeSamples = 0;
+  if (!enabled) return;
+  peakLift = max(peakLift, fabsf(vertical));
+  peakSide = max(peakSide, fabsf(side));
+  peakPitch = max(peakPitch, fabsf(gyro[HAND_SIDE_AXIS]));
+  peakRoll = max(peakRoll, fabsf(gyro[HAND_FORWARD_AXIS]));
+  if (now - lastReportMs < 250) return;
+  lastReportMs = now;
+  Serial.printf("%s angle=%.0f deg | lift=%.1f side=%.1f m/s^2 | pitch=%.1f roll=%.1f rad/s\n",
+                controlsEnabled ? "ON" : "LOCKED", palmAngle(), peakLift, peakSide, peakPitch, peakRoll);
+  peakLift = peakSide = peakPitch = peakRoll = 0.0f;
 }
 
 void setup() {
@@ -389,7 +349,7 @@ void setup() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   delay(200);
   if (!calibrate()) {
-    Serial.println("ERROR: Calibration failed. Check the sensor and reset while holding still.");
+    Serial.println("ERROR: Calibration failed. Check the sensor, then reset with your palm down and still.");
     return;
   }
   if (!startRadio()) {
@@ -398,8 +358,7 @@ void setup() {
   }
   lastSampleUs = micros();
   ready = true;
-  Serial.println("SLIDER LOCKED: twist your wrist to enable it.");
-  Serial.println("Serial radio test: send t for one brightness increase.");
+  Serial.println("CONTROLS LOCKED: flick your wrist up or down. Send d for motion debug.");
 }
 
 void loop() {
@@ -410,23 +369,17 @@ void loop() {
       Serial.println("Gesture send failed. Check receiver power and MAC.");
     } else if (lastSentCommand == FLICK_LEFT_COMMAND || lastSentCommand == FLICK_RIGHT_COMMAND) {
       Serial.println("Animation command delivered.");
-    } else if (millis() - lastDeliveryLogMs >= 300) {
-      lastDeliveryLogMs = millis();
-      Serial.printf("Brightness command delivered: %+ld\n",
-                    static_cast<long>(lastSentCommand - SLIDER_DELTA_BASE));
+    } else {
+      lastDeliveredBrightness = lastSentCommand - BRIGHTNESS_SET_BASE;
+      if (millis() - lastDeliveryLogMs >= 300) {
+        lastDeliveryLogMs = millis();
+        Serial.printf("Palm brightness delivered: %d/%d\n", lastDeliveredBrightness, PWM_MAX);
+      }
     }
   }
   if (!ready) {
     delay(10);
     return;
-  }
-  if (Serial.available() && Serial.read() == 't') {
-    if (sendInFlight) {
-      Serial.println("Radio is busy. Send t again while holding still.");
-    } else {
-      Serial.println("Sending one brightness test to the lamp.");
-      sendCommand(SLIDER_DELTA_BASE + BRIGHTNESS_STEP);
-    }
   }
   const uint32_t nowUs = micros();
   const uint32_t elapsedUs = nowUs - lastSampleUs;
@@ -440,9 +393,9 @@ void loop() {
   const uint32_t now = millis();
   float accel[3], gyro[3];
   if (!readMotion(accel, gyro)) {
-    Serial.println("ERROR: MPU6050 read failed. Slider locked. Check wiring and reset.");
+    Serial.println("ERROR: MPU6050 read failed. Controls locked. Check wiring and reset.");
     ready = false;
-    sliderEnabled = false;
+    controlsEnabled = false;
     pendingAnimation = 0;
     return;
   }
@@ -450,10 +403,7 @@ void loop() {
   const float rotation = length(gyro);
   float vertical, side;
   measureHandAcceleration(accel, gyro, rotation, dt, vertical, side);
-  updateTwist(gyro[WRIST_ROLL_AXIS], rotation, dt, now);
-
-  if (!sliderEnabled || now - lastTwistMs < ROTATION_SETTLE_MS) return;
-  updateBrightness(vertical, dt, now);
-  updateSideFlick(side, now);
+  updateHandControls(vertical, side, gyro, now);
+  printMotionDebug(vertical, side, gyro, now);
   sendPendingCommand(now);
 }

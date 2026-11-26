@@ -6,43 +6,51 @@ classic ESP32 board with a USB-to-serial bridge described below.
 
 ## Current board: classic ESP32 + MPU6050
 
-### Wrist controlled brightness slider and animations
+### Palm angle brightness and animations
 
 The combined sketches are in `gesture_slider_sender` and
 `gesture_slider_receiver`. Use the original `sender_espnow` and
 `receiver_espnow` sketches for the original flick controls.
 
-The hand unit starts with the slider locked. Hold your hand still at power-on
-for calibration. With the MPU6050 on the back of the hand, roll your wrist
-about the wrist-to-fingertip axis until the sender prints `SLIDER ON`. Move your
-whole hand up and the lamp brightens by 15 levels every 50 ms while upward
-motion is detected. Lower your hand for the same steps downward. Hand speed
-does not change the step size or rate. The brightness holds when movement stops,
-and you can reverse direction without pausing. A hard sideways flick with a
-quick stop picks the next or previous animation during the slide. Roll your wrist
-again to lock the hand controls at the current brightness and animation setting.
-A deliberate twist in either direction toggles the mode. Turn back slowly if
-you are just resetting your hand position.
+Mount the MPU6050 flat against the hand with its X axis running from wrist to
+fingertips. Hold your palm level, facing down, and still at power-on. The hand
+unit starts locked. Quickly bend your wrist to snap your fingertips up or down,
+or give the whole hand a quick upward or downward flick, to toggle the lock.
+Roll your palm from facing down to facing up to change brightness while unlocked.
 
-Mount the MPU6050's X axis along the hand. If the Y axis runs along your hand,
-change `WRIST_ROLL_AXIS` from `0` to `1` in the sender before uploading. If the
-sideways gestures are reversed, set `SIDE_SIGN` to `-1`. The
-MPU6050 estimates movement direction from acceleration. Very slow movements may
-not register.
+| Palm position | Brightness |
+| --- | ---: |
+| Down (0 degrees) | 0 (off) |
+| Edge-on (90 degrees) | 512 |
+| Up (180 degrees) | 1023 (full) |
+
+Between the endpoints the target changes by about 5.7 PWM levels per degree.
+The lamp follows the angle as you turn, and holding an angle holds the setting.
+A hard sideways flick still selects the next or previous animation while
+unlocked. When locked, both hand controls stop sending changes, and the lamp
+keeps playing the selected animation at the last brightness setting.
+
+If the sensor's Y axis runs along the hand, set `HAND_FORWARD_AXIS` to `1`.
+If left and right are reversed, set `SIDE_SIGN` to `-1`.
 
 1. In Arduino IDE use **esp32 by Espressif Systems 3.3.12** and select the
    lamp receiver's board and COM port. The current GPIO23 lamp receiver uses
    **ESP32 Dev Module**. Upload `gesture_slider_receiver/gesture_slider_receiver.ino`.
-   The updated receiver prints `Brightness adjusts in every animation mode.`
+   The updated receiver prints `Ready for palm-angle brightness and legacy
+   gesture commands.`
 2. Open the receiver's Serial Monitor at **115200 baud** and reset it to check
    its station MAC address. If it differs from the address in `receiverMAC`,
    update that value in the sender.
 3. Select **ESP32 Dev Module** and the hand unit's COM port. Upload
    `gesture_slider_sender/gesture_slider_sender.ino`. The MPU6050 uses SDA 21 and SCL 22 as below.
-4. Lift and lower your hand in one continuous motion and flick sideways during
-   the movement. Lock it with another twist and verify that hand motion leaves
-   both settings alone.
+4. Flick up once to unlock. Turn your palm from down to up and back, and test
+   a sideways animation flick. Flick down once to lock. Check that either hand
+   gesture leaves the brightness and selected animation alone while locked.
    Repeat after powering both boards from their standalone supplies.
+
+If a flick is missed, open the hand unit's Serial Monitor at **115200 baud**
+and send `d`. The motion report prints the palm angle and peak lift, sideways,
+pitch (wrist bend), and roll (palm turn) readings every 250 ms. Send `d` again to stop.
 
 Upload each updated sketch once over USB with its board's external supply
 disconnected. Unplug USB before reconnecting that supply. The ESP32 keeps its
